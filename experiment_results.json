@@ -1,0 +1,42 @@
+{
+  "experiment_name": "kenyan_fl_experiment",
+  "start_time": "2026-09-02T11:53:37.997714",
+  "export_time": "2026-09-02T11:57:11.392558",
+  "configuration": {},
+  "total_rounds": 3,
+  "rounds": [
+    {
+      "round": 1,
+      "accuracy": 0.52,
+      "loss": 1.1,
+      "participating_clients": [
+        "dholuo_client",
+        "kalenjin_client"
+      ],
+      "client_count": 2,
+      "timestamp": "2026-09-02T11:54:14.075990"
+    },
+    {
+      "round": 2,
+      "accuracy": 0.65,
+      "loss": 0.88,
+      "participating_clients": [
+        "dholuo_client",
+        "kidawida_client"
+      ],
+      "client_count": 2,
+      "timestamp": "2026-09-02T11:54:14.130041"
+    },
+    {
+      "round": 3,
+      "accuracy": 0.79,
+      "loss": 0.54,
+      "participating_clients": [
+        "kalenjin_client",
+        "kidawida_client"
+      ],
+      "client_count": 2,
+      "timestamp": "2026-09-02T11:54:14.151399"
+    }
+  ]
+}

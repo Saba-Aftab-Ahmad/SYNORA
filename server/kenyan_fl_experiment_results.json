@@ -1,0 +1,19 @@
+{
+  "experiment_name": "test_experiment",
+  "start_time": "2026-09-02T06:11:22.659245",
+  "export_time": "2026-09-02T06:11:22.660084",
+  "configuration": {},
+  "total_rounds": 1,
+  "rounds": [
+    {
+      "round": 1,
+      "accuracy": 0.8,
+      "loss": 0.3,
+      "participating_clients": [
+        "c1"
+      ],
+      "client_count": 1,
+      "timestamp": "2026-09-02T06:11:22.659647"
+    }
+  ]
+}

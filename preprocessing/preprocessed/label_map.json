@@ -1,0 +1,6 @@
+{
+  "complaint": 0,
+  "greeting": 1,
+  "positive": 2,
+  "request": 3
+}

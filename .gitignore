@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.zip
+.env
+*.json.bak
+node_modules/
+data/checkpoints/
+data/logs/
+*.env
+migrations/
