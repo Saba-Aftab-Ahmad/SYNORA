@@ -26,21 +26,32 @@ def init_db(app):
     if not database_url:
         raise ValueError(
             "DATABASE_URL environment variable not set. "
-            "Copy .env.example to .env and fill in your "
-            "Supabase connection string."
+            "Add it to Render environment variables."
         )
 
-    # Fix for SQLAlchemy — Supabase uses postgres://
-    # but SQLAlchemy requires postgresql://
+    # Fix 1: SQLAlchemy requires postgresql:// not postgres://
     if database_url.startswith("postgres://"):
-        database_url = database_url.replace("postgres://", "postgresql://", 1)
+        database_url = database_url.replace(
+            "postgres://", "postgresql://", 1
+        )
+
+    # Fix 2: Use psycopg3 driver syntax
+    # Replace postgresql:// with postgresql+psycopg://
+    if "postgresql://" in database_url and "+psycopg" not in database_url:
+        database_url = database_url.replace(
+            "postgresql://",
+            "postgresql+psycopg://",
+            1
+        )
 
     app.config["SQLALCHEMY_DATABASE_URI"] = database_url
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
     app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
         "pool_pre_ping": True,
         "pool_recycle": 300,
+        "pool_size": 5,
+        "max_overflow": 2,
     }
 
     db.init_app(app)
-    print(f"Database connected successfully")
+    print("Database connected successfully")
