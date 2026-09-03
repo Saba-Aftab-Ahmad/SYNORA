@@ -1,11 +1,12 @@
 """
 Synora: Browser-Based Federated Learning Toolkit
 =================================================
-Coordination Server — Single Entry Point
+Coordination Server — Production Version
 
-Implements all server-side REST API endpoints for the
-federated learning coordination layer, covering:
+All state is persisted in PostgreSQL via Supabase.
+No in-memory storage — safe to restart at any time.
 
+User Stories covered:
     US-08  — Browser client registration
     US-11  — Aggregation participation threshold
     US-12  — Random client selection
@@ -13,93 +14,77 @@ federated learning coordination layer, covering:
     US-16  — FL experiment parameter configuration
     US-17  — Experiment results export (JSON + CSV)
 
-Dependencies:
-    pip install flask
+Run locally:
+    python server/coordination_server.py
 
-Run:
-    python coordination_server.py
+Run in production:
+    gunicorn server.coordination_server:app
 
 Author: Kashaf Kamran
 Project: SBFLT — Synora FYP
 """
 
-from flask import Flask, request, jsonify, send_file
 import uuid
-import sys
+import csv
+import json
+import io
 import os
+import sys
+import random
+from datetime import datetime
 
-# ── Local module imports ──────────────────────────────────
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
+from flask_migrate import Migrate
+
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from aggregation_config import AggregationConfig
-from client_selector import ClientSelector
-from experiment_tracker import ExperimentTracker
+from server.database import db, init_db
+from server.models import (
+    Client,
+    Round,
+    ExperimentConfig,
+    ExperimentLog,
+    AggregationConfig
+)
 
 # ── App initialisation ────────────────────────────────────
 app = Flask(__name__)
+CORS(app)
 
-
-# ── In-memory state ───────────────────────────────────────
-registered_clients = {}
+# Initialise database
+init_db(app)
+migrate = Migrate(app, db)
 
 # Available language pair partitions
-# Each maps to a Kenyan low-resource language dataset
-data_partitions = [
-    "dav_swa",  # Kidawida — Kiswahili
-    "kln_swa",  # Kalenjin — Kiswahili
-    "luo_swa",  # Dholuo   — Kiswahili
-]
-
-# Aggregation configuration (min clients, max rounds)
-config = AggregationConfig(min_clients=2, max_rounds=10)
-
-# Client selector for random and resource-aware selection
-selector = ClientSelector(selection_count=2)
-
-# Experiment tracker for logging rounds and exporting results
-tracker = ExperimentTracker(experiment_name="kenyan_fl_experiment")
+DATA_PARTITIONS = ["dav_swa", "kln_swa", "luo_swa"]
 
 
-# ── Helper functions ──────────────────────────────────────
+def assign_partition(client_count: int) -> str:
+    """Assign partition using round-robin distribution."""
+    return DATA_PARTITIONS[client_count % len(DATA_PARTITIONS)]
 
 
-def assign_partition(client_index: int) -> str:
-    """
-    Assign a language dataset partition to a client
-    using round-robin distribution.
-
-    Args:
-        client_index (int): Current number of registered
-                            clients before this one
-
-    Returns:
-        str: Partition identifier string
-    """
-    return data_partitions[client_index % len(data_partitions)]
+def get_or_create_aggregation_config():
+    """Get aggregation config from DB or create default."""
+    config = AggregationConfig.query.first()
+    if not config:
+        config = AggregationConfig(
+            min_clients=2,
+            max_rounds=10,
+            current_round=0
+        )
+        db.session.add(config)
+        db.session.commit()
+    return config
 
 
 # ═══════════════════════════════════════════════════════════
 # US-08 — Client Registration
 # ═══════════════════════════════════════════════════════════
 
-
 @app.route("/register", methods=["POST"])
 def register_client():
-    """
-    Register a browser client with the coordination server.
-
-    Assigns a unique client ID and a language dataset
-    partition. Rejects duplicate registrations.
-
-    Request body (JSON):
-        { "client_name": "client_A" }
-
-    Returns:
-        200 — Registration successful with client_id
-              and partition assignment
-        400 — Missing client_name field
-        409 — Client already registered
-    """
     data = request.get_json()
 
     if not data or "client_name" not in data:
@@ -107,79 +92,57 @@ def register_client():
 
     client_name = data["client_name"]
 
-    # Reject duplicate registrations
-    for cid, info in registered_clients.items():
-        if info["client_name"] == client_name:
-            return (
-                jsonify(
-                    {
-                        "error": (f"Client '{client_name}' " f"is already registered"),
-                        "client_id": cid,
-                    }
-                ),
-                409,
-            )
+    existing = Client.query.filter_by(client_name=client_name).first()
+    if existing:
+        return jsonify({
+            "error": f"Client '{client_name}' is already registered",
+            "client_id": existing.client_id
+        }), 409
 
-    # Generate unique client ID
     client_id = str(uuid.uuid4())
+    client_count = Client.query.count()
+    partition = assign_partition(client_count)
 
-    # Assign partition using round-robin
-    partition = assign_partition(len(registered_clients))
-
-    # Store client record
-    registered_clients[client_id] = {
-        "client_name": client_name,
-        "partition": partition,
-        "status": "active",
-    }
-
-    return (
-        jsonify(
-            {
-                "message": "Registration successful",
-                "client_id": client_id,
-                "partition": partition,
-                "status": "active",
-            }
-        ),
-        200,
+    new_client = Client(
+        client_id=client_id,
+        client_name=client_name,
+        partition=partition,
+        status="active"
     )
+
+    db.session.add(new_client)
+    db.session.commit()
+
+    return jsonify({
+        "message": "Registration successful",
+        "client_id": client_id,
+        "partition": partition,
+        "status": "active"
+    }), 200
 
 
 @app.route("/clients", methods=["GET"])
 def get_clients():
-    """
-    Retrieve all registered clients and their details.
+    clients = Client.query.all()
+    return jsonify({
+        "total_clients": len(clients),
+        "clients": {c.client_id: c.to_dict() for c in clients}
+    }), 200
 
-    Returns:
-        200 — List of all clients with partition and status
-    """
-    return (
-        jsonify(
-            {"total_clients": len(registered_clients), "clients": registered_clients}
-        ),
-        200,
-    )
+
+@app.route("/clients/reset", methods=["DELETE"])
+def reset_clients():
+    Client.query.delete()
+    db.session.commit()
+    return jsonify({"message": "All clients cleared"}), 200
 
 
 # ═══════════════════════════════════════════════════════════
 # US-11 — Aggregation Participation Threshold
 # ═══════════════════════════════════════════════════════════
 
-
 @app.route("/config/threshold", methods=["POST"])
 def set_threshold():
-    """
-    Set the minimum number of clients required before
-    aggregation is triggered for a federated round.
-
-    Request body (JSON):
-        { "min_clients": 3 }
-
-    Returns:
-        200 — Threshold updated with new config
-        400 — Missing or invalid min_clients value
-    """
     data = request.get_json()
 
     if not data or "min_clients" not in data:
@@ -187,77 +150,55 @@ def set_threshold():
 
     try:
         min_clients = int(data["min_clients"])
-        config.set_threshold(min_clients)
-        return (
-            jsonify(
-                {
-                    "message": f"Threshold set to {min_clients}",
-                    "config": config.get_config(),
-                }
-            ),
-            200,
-        )
+        if min_clients < 1:
+            raise ValueError("min_clients must be at least 1")
+
+        config = get_or_create_aggregation_config()
+        config.min_clients = min_clients
+        config.updated_at = datetime.utcnow()
+        db.session.commit()
+
+        return jsonify({
+            "message": f"Threshold set to {min_clients}",
+            "config": config.to_dict()
+        }), 200
+
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
 
 @app.route("/config/threshold", methods=["GET"])
 def get_threshold():
-    """
-    Retrieve the current aggregation threshold configuration.
-
-    Returns:
-        200 — Current min_clients and max_rounds config
-    """
-    return jsonify(config.get_config()), 200
+    config = get_or_create_aggregation_config()
+    return jsonify(config.to_dict()), 200
 
 
 @app.route("/aggregate/check", methods=["GET"])
 def check_aggregation():
-    """
-    Check whether the current number of connected clients
-    meets the aggregation threshold.
+    config = get_or_create_aggregation_config()
+    connected = Client.query.filter_by(status="active").count()
+    can_aggregate = connected >= config.min_clients
 
-    Advances the round counter each time it is called.
+    if can_aggregate:
+        config.current_round += 1
+        config.updated_at = datetime.utcnow()
+        db.session.commit()
 
-    Returns:
-        200 — Aggregation status with READY or WAITING
-    """
-    connected = len(registered_clients)
-    can_aggregate = config.can_aggregate(connected)
-    config.next_round()
-
-    return (
-        jsonify(
-            {
-                "can_aggregate": can_aggregate,
-                "connected_clients": connected,
-                "min_required": config.min_clients,
-                "current_round": config.current_round,
-                "status": ("READY" if can_aggregate else "WAITING — below threshold"),
-            }
-        ),
-        200,
-    )
+    return jsonify({
+        "can_aggregate": can_aggregate,
+        "connected_clients": connected,
+        "min_required": config.min_clients,
+        "current_round": config.current_round,
+        "status": "READY" if can_aggregate else "WAITING — below threshold"
+    }), 200
 
 
 # ═══════════════════════════════════════════════════════════
-# US-12 + US-13 — Client Selection (Random + Resource-Aware)
+# US-12 + US-13 — Client Selection
 # ═══════════════════════════════════════════════════════════
-
 
 @app.route("/config/selection", methods=["POST"])
 def set_selection_count():
-    """
-    Set the number of clients to select per federated round.
-
-    Request body (JSON):
-        { "selection_count": 2 }
-
-    Returns:
-        200 — Selection count updated
-        400 — Missing or invalid selection_count
-    """
     data = request.get_json()
 
     if not data or "selection_count" not in data:
@@ -265,203 +206,252 @@ def set_selection_count():
 
     try:
         count = int(data["selection_count"])
-        selector.set_selection_count(count)
-        return (
-            jsonify(
-                {"message": f"Selection count set to {count}", "selection_count": count}
-            ),
-            200,
-        )
+        if count < 1:
+            raise ValueError("selection_count must be at least 1")
+
+        app.config["SELECTION_COUNT"] = count
+
+        return jsonify({
+            "message": f"Selection count set to {count}",
+            "selection_count": count
+        }), 200
+
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
 
 @app.route("/select/clients", methods=["GET"])
 def select_clients():
-    """
-    Select a subset of registered clients to participate
-    in the current federated training round.
+    selection_count = app.config.get("SELECTION_COUNT", 2)
+    all_clients = Client.query.filter_by(status="active").all()
 
-    Uses the ClientSelector strategy (random or
-    resource-aware depending on configuration).
-
-    Returns:
-        200 — Selected clients with their partition details
-        400 — No clients registered
-    """
-    available = list(registered_clients.keys())
-
-    if len(available) == 0:
+    if not all_clients:
         return jsonify({"error": "No clients registered"}), 400
 
-    selected = selector.select_clients(available)
-    selected_info = {cid: registered_clients[cid] for cid in selected}
+    count = min(selection_count, len(all_clients))
+    selected = random.sample(all_clients, count)
+    config = get_or_create_aggregation_config()
 
-    return (
-        jsonify(
-            {
-                "round": selector.round_number,
-                "selected_count": len(selected),
-                "selected_clients": selected_info,
-                "total_available": len(available),
-            }
-        ),
-        200,
-    )
+    return jsonify({
+        "round": config.current_round,
+        "selected_count": len(selected),
+        "selected_clients": {c.client_id: c.to_dict() for c in selected},
+        "total_available": len(all_clients)
+    }), 200
 
 
 @app.route("/select/history", methods=["GET"])
 def get_selection_history():
-    """
-    Retrieve client selection history including frequency
-    distribution and bias analysis across all rounds.
+    all_clients = Client.query.all()
+    logs = ExperimentLog.query.all()
 
-    Returns:
-        200 — Stats, frequency distribution, bias check
-    """
-    available = list(registered_clients.keys())
+    participation = {c.client_name: 0 for c in all_clients}
 
-    return (
-        jsonify(
-            {
-                "stats": selector.get_stats(),
-                "frequency_distribution": (
-                    selector.get_frequency_distribution(available)
-                ),
-                "bias_check": selector.check_bias(available),
-            }
-        ),
-        200,
-    )
+    for log in logs:
+        for name in log.participating_clients.split(","):
+            name = name.strip()
+            if name in participation:
+                participation[name] += 1
+
+    total_rounds = len(logs)
+
+    return jsonify({
+        "total_rounds": total_rounds,
+        "participation_counts": participation,
+        "participation_rates": {
+            name: (round(count / total_rounds, 4) if total_rounds > 0 else 0)
+            for name, count in participation.items()
+        }
+    }), 200
 
 
 # ═══════════════════════════════════════════════════════════
-# US-16 — FL Experiment Parameter Configuration
+# US-16 — FL Experiment Configuration
 # ═══════════════════════════════════════════════════════════
-
 
 @app.route("/experiment/config", methods=["POST"])
 def set_experiment_config():
-    """
-    Save the FL experiment hyperparameter configuration.
-
-    Request body (JSON):
-        {
-            "num_rounds": 10,
-            "learning_rate": 0.01,
-            "batch_size": 32,
-            "local_epochs": 5,
-            "partition_type": "non_iid",
-            "dirichlet_alpha": 0.5
-        }
-
-    Returns:
-        200 — Config saved successfully
-        400 — No config data provided
-    """
     data = request.get_json()
 
     if not data:
         return jsonify({"error": "Config data required"}), 400
 
-    tracker.set_config(data)
+    config = ExperimentConfig(
+        experiment_name=data.get("experiment_name", "kenyan_fl_experiment"),
+        num_rounds=data.get("num_rounds", 10),
+        num_clients=data.get("num_clients", 3),
+        min_clients_per_round=data.get("min_clients_per_round", 2),
+        learning_rate=data.get("learning_rate", 0.01),
+        batch_size=data.get("batch_size", 32),
+        local_epochs=data.get("local_epochs", 5),
+        partition_type=data.get("partition_type", "non_iid"),
+        dirichlet_alpha=data.get("dirichlet_alpha", 0.5),
+        languages=",".join(data.get("languages", ["dholuo", "kalenjin", "kidawida"]))
+    )
 
-    return jsonify({"message": "Experiment config saved", "config": data}), 200
+    db.session.add(config)
+    db.session.commit()
+
+    return jsonify({
+        "message": "Experiment config saved",
+        "config": config.to_dict()
+    }), 200
+
+
+@app.route("/experiment/config", methods=["GET"])
+def get_experiment_config():
+    config = ExperimentConfig.query.order_by(
+        ExperimentConfig.created_at.desc()
+    ).first()
+
+    if not config:
+        return jsonify({"error": "No experiment config saved yet"}), 404
+
+    return jsonify(config.to_dict()), 200
 
 
 # ═══════════════════════════════════════════════════════════
 # US-17 — Experiment Results Export
 # ═══════════════════════════════════════════════════════════
 
-
 @app.route("/experiment/log", methods=["POST"])
 def log_round():
-    """
-    Log metrics for a completed federated training round.
-
-    Request body (JSON):
-        {
-            "round": 1,
-            "accuracy": 0.72,
-            "loss": 0.54,
-            "participating_clients": ["id1", "id2"]
-        }
-
-    Returns:
-        200 — Round logged with stored data
-        400 — Missing or invalid round data
-    """
     data = request.get_json()
 
     if not data:
         return jsonify({"error": "Round data required"}), 400
 
     try:
-        round_data = tracker.log_round(
-            round_num=data.get("round", len(tracker.rounds) + 1),
+        participating = data.get("participating_clients", [])
+
+        log = ExperimentLog(
+            round_number=int(data.get("round", ExperimentLog.query.count() + 1)),
             accuracy=float(data.get("accuracy", 0)),
             loss=float(data.get("loss", 0)),
-            participating_clients=data.get("participating_clients", []),
+            participating_clients=",".join(participating),
+            client_count=len(participating)
         )
-        return jsonify({"message": "Round logged", "round_data": round_data}), 200
+
+        db.session.add(log)
+        db.session.commit()
+
+        return jsonify({
+            "message": "Round logged",
+            "round_data": log.to_dict()
+        }), 200
+
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
 
 @app.route("/experiment/summary", methods=["GET"])
 def get_summary():
-    """
-    Retrieve a full summary of the experiment including
-    all round metrics, accuracy trend, and configuration.
+    logs = ExperimentLog.query.order_by(ExperimentLog.round_number).all()
+    config = ExperimentConfig.query.order_by(
+        ExperimentConfig.created_at.desc()
+    ).first()
 
-    Returns:
-        200 — Complete experiment summary
-    """
-    return jsonify(tracker.get_summary()), 200
+    return jsonify({
+        "experiment_name": config.experiment_name if config else "kenyan_fl_experiment",
+        "total_rounds": len(logs),
+        "configuration": config.to_dict() if config else {},
+        "rounds": [log.to_dict() for log in logs],
+        "start_time": logs[0].logged_at.isoformat() if logs else None,
+        "export_time": datetime.utcnow().isoformat()
+    }), 200
 
 
 @app.route("/experiment/export/json", methods=["GET"])
 def export_json():
-    """
-    Export all experiment results as a downloadable
-    JSON file for external analysis.
-
-    Returns:
-        200 — JSON file download
-        400 — Export error
-    """
     try:
-        filepath = os.path.join(
-            os.path.dirname(__file__), "kenyan_fl_experiment_results.json"
-        )
-        tracker.export_json(filepath)
+        logs = ExperimentLog.query.order_by(ExperimentLog.round_number).all()
+        config = ExperimentConfig.query.order_by(
+            ExperimentConfig.created_at.desc()
+        ).first()
+
+        payload = {
+            "experiment_name": config.experiment_name if config else "kenyan_fl_experiment",
+            "export_time": datetime.utcnow().isoformat(),
+            "configuration": config.to_dict() if config else {},
+            "total_rounds": len(logs),
+            "rounds": [log.to_dict() for log in logs]
+        }
+
+        buffer = io.BytesIO()
+        buffer.write(json.dumps(payload, indent=2).encode("utf-8"))
+        buffer.seek(0)
+
         return send_file(
-            filepath, as_attachment=True, download_name="experiment_results.json"
+            buffer,
+            mimetype="application/json",
+            as_attachment=True,
+            download_name="experiment_results.json"
         )
+
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
 
 @app.route("/experiment/export/csv", methods=["GET"])
 def export_csv():
-    """
-    Export all experiment results as a downloadable
-    CSV file for spreadsheet analysis.
-
-    Returns:
-        200 — CSV file download
-        400 — Export error
-    """
     try:
-        filepath = os.path.join(
-            os.path.dirname(__file__), "kenyan_fl_experiment_results.csv"
-        )
-        tracker.export_csv(filepath)
+        logs = ExperimentLog.query.order_by(ExperimentLog.round_number).all()
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "round", "accuracy", "loss",
+            "client_count", "participating_clients", "logged_at"
+        ])
+
+        for log in logs:
+            writer.writerow([
+                log.round_number, log.accuracy, log.loss,
+                log.client_count, log.participating_clients,
+                log.logged_at.isoformat()
+            ])
+
+        buffer = io.BytesIO()
+        buffer.write(output.getvalue().encode("utf-8"))
+        buffer.seek(0)
+
         return send_file(
-            filepath, as_attachment=True, download_name="experiment_results.csv"
+            buffer,
+            mimetype="text/csv",
+            as_attachment=True,
+            download_name="experiment_results.csv"
         )
+
     except Exception as e:
         return jsonify({"error": str(e)}), 400
+
+
+@app.route("/experiment/reset", methods=["DELETE"])
+def reset_experiment():
+    ExperimentLog.query.delete()
+    db.session.commit()
+    return jsonify({"message": "Experiment logs cleared"}), 200
+
+
+# ═══════════════════════════════════════════════════════════
+# Health Check
+# ═══════════════════════════════════════════════════════════
+
+@app.route("/health", methods=["GET"])
+def health_check():
+    try:
+        client_count = Client.query.count()
+        return jsonify({
+            "status": "healthy",
+            "database": "connected",
+            "registered_clients": client_count,
+            "timestamp": datetime.utcnow().isoformat()
+        }), 200
+    except Exception as e:
+        return jsonify({
+            "status": "unhealthy",
+            "error": str(e)
+        }), 500
 
 
 # ═══════════════════════════════════════════════════════════
@@ -469,35 +459,14 @@ def export_csv():
 # ═══════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    with app.app_context():
+        db.create_all()
+
     print("=" * 55)
-    print("  Synora Coordination Server")
-    print("  Browser-Based Federated Learning Toolkit")
+    print("  Synora Coordination Server — Production")
+    print("  All state persisted in PostgreSQL")
     print("=" * 55)
-    print()
-    print("  CLIENT REGISTRATION (US-08)")
-    print("  POST /register")
-    print("  GET  /clients")
-    print()
-    print("  AGGREGATION THRESHOLD (US-11)")
-    print("  POST /config/threshold")
-    print("  GET  /config/threshold")
-    print("  GET  /aggregate/check")
-    print()
-    print("  CLIENT SELECTION (US-12, US-13)")
-    print("  POST /config/selection")
-    print("  GET  /select/clients")
-    print("  GET  /select/history")
-    print()
-    print("  EXPERIMENT CONFIG (US-16)")
-    print("  POST /experiment/config")
-    print()
-    print("  RESULTS EXPORT (US-17)")
-    print("  POST /experiment/log")
-    print("  GET  /experiment/summary")
-    print("  GET  /experiment/export/json")
-    print("  GET  /experiment/export/csv")
-    print()
     print("  Running at: http://127.0.0.1:5000")
     print("=" * 55)
 
-    app.run(debug=True)
+    app.run(debug=False, host="0.0.0.0", port=5000)
