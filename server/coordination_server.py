@@ -24,6 +24,7 @@ Author: Kashaf Kamran
 Project: SBFLT — Synora FYP
 """
 
+import numpy as np
 import uuid
 import csv
 import json
@@ -45,7 +46,7 @@ from server.models import (
     Round,
     ExperimentConfig,
     ExperimentLog,
-    AggregationConfig
+    AggregationConfig,
 )
 
 # ── App initialisation ────────────────────────────────────
@@ -69,11 +70,7 @@ def get_or_create_aggregation_config():
     """Get aggregation config from DB or create default."""
     config = AggregationConfig.query.first()
     if not config:
-        config = AggregationConfig(
-            min_clients=2,
-            max_rounds=10,
-            current_round=0
-        )
+        config = AggregationConfig(min_clients=2, max_rounds=10, current_round=0)
         db.session.add(config)
         db.session.commit()
     return config
@@ -82,6 +79,7 @@ def get_or_create_aggregation_config():
 # ═══════════════════════════════════════════════════════════
 # US-08 — Client Registration
 # ═══════════════════════════════════════════════════════════
+
 
 @app.route("/register", methods=["POST"])
 def register_client():
@@ -94,10 +92,15 @@ def register_client():
 
     existing = Client.query.filter_by(client_name=client_name).first()
     if existing:
-        return jsonify({
-            "error": f"Client '{client_name}' is already registered",
-            "client_id": existing.client_id
-        }), 409
+        return (
+            jsonify(
+                {
+                    "error": f"Client '{client_name}' is already registered",
+                    "client_id": existing.client_id,
+                }
+            ),
+            409,
+        )
 
     client_id = str(uuid.uuid4())
     client_count = Client.query.count()
@@ -107,27 +110,37 @@ def register_client():
         client_id=client_id,
         client_name=client_name,
         partition=partition,
-        status="active"
+        status="active",
     )
 
     db.session.add(new_client)
     db.session.commit()
 
-    return jsonify({
-        "message": "Registration successful",
-        "client_id": client_id,
-        "partition": partition,
-        "status": "active"
-    }), 200
+    return (
+        jsonify(
+            {
+                "message": "Registration successful",
+                "client_id": client_id,
+                "partition": partition,
+                "status": "active",
+            }
+        ),
+        200,
+    )
 
 
 @app.route("/clients", methods=["GET"])
 def get_clients():
     clients = Client.query.all()
-    return jsonify({
-        "total_clients": len(clients),
-        "clients": {c.client_id: c.to_dict() for c in clients}
-    }), 200
+    return (
+        jsonify(
+            {
+                "total_clients": len(clients),
+                "clients": {c.client_id: c.to_dict() for c in clients},
+            }
+        ),
+        200,
+    )
 
 
 @app.route("/clients/reset", methods=["DELETE"])
@@ -140,6 +153,7 @@ def reset_clients():
 # ═══════════════════════════════════════════════════════════
 # US-11 — Aggregation Participation Threshold
 # ═══════════════════════════════════════════════════════════
+
 
 @app.route("/config/threshold", methods=["POST"])
 def set_threshold():
@@ -158,10 +172,15 @@ def set_threshold():
         config.updated_at = datetime.utcnow()
         db.session.commit()
 
-        return jsonify({
-            "message": f"Threshold set to {min_clients}",
-            "config": config.to_dict()
-        }), 200
+        return (
+            jsonify(
+                {
+                    "message": f"Threshold set to {min_clients}",
+                    "config": config.to_dict(),
+                }
+            ),
+            200,
+        )
 
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -184,18 +203,24 @@ def check_aggregation():
         config.updated_at = datetime.utcnow()
         db.session.commit()
 
-    return jsonify({
-        "can_aggregate": can_aggregate,
-        "connected_clients": connected,
-        "min_required": config.min_clients,
-        "current_round": config.current_round,
-        "status": "READY" if can_aggregate else "WAITING — below threshold"
-    }), 200
+    return (
+        jsonify(
+            {
+                "can_aggregate": can_aggregate,
+                "connected_clients": connected,
+                "min_required": config.min_clients,
+                "current_round": config.current_round,
+                "status": "READY" if can_aggregate else "WAITING — below threshold",
+            }
+        ),
+        200,
+    )
 
 
 # ═══════════════════════════════════════════════════════════
 # US-12 + US-13 — Client Selection
 # ═══════════════════════════════════════════════════════════
+
 
 @app.route("/config/selection", methods=["POST"])
 def set_selection_count():
@@ -211,10 +236,12 @@ def set_selection_count():
 
         app.config["SELECTION_COUNT"] = count
 
-        return jsonify({
-            "message": f"Selection count set to {count}",
-            "selection_count": count
-        }), 200
+        return (
+            jsonify(
+                {"message": f"Selection count set to {count}", "selection_count": count}
+            ),
+            200,
+        )
 
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -232,12 +259,17 @@ def select_clients():
     selected = random.sample(all_clients, count)
     config = get_or_create_aggregation_config()
 
-    return jsonify({
-        "round": config.current_round,
-        "selected_count": len(selected),
-        "selected_clients": {c.client_id: c.to_dict() for c in selected},
-        "total_available": len(all_clients)
-    }), 200
+    return (
+        jsonify(
+            {
+                "round": config.current_round,
+                "selected_count": len(selected),
+                "selected_clients": {c.client_id: c.to_dict() for c in selected},
+                "total_available": len(all_clients),
+            }
+        ),
+        200,
+    )
 
 
 @app.route("/select/history", methods=["GET"])
@@ -255,19 +287,25 @@ def get_selection_history():
 
     total_rounds = len(logs)
 
-    return jsonify({
-        "total_rounds": total_rounds,
-        "participation_counts": participation,
-        "participation_rates": {
-            name: (round(count / total_rounds, 4) if total_rounds > 0 else 0)
-            for name, count in participation.items()
-        }
-    }), 200
+    return (
+        jsonify(
+            {
+                "total_rounds": total_rounds,
+                "participation_counts": participation,
+                "participation_rates": {
+                    name: (round(count / total_rounds, 4) if total_rounds > 0 else 0)
+                    for name, count in participation.items()
+                },
+            }
+        ),
+        200,
+    )
 
 
 # ═══════════════════════════════════════════════════════════
 # US-16 — FL Experiment Configuration
 # ═══════════════════════════════════════════════════════════
+
 
 @app.route("/experiment/config", methods=["POST"])
 def set_experiment_config():
@@ -286,23 +324,21 @@ def set_experiment_config():
         local_epochs=data.get("local_epochs", 5),
         partition_type=data.get("partition_type", "non_iid"),
         dirichlet_alpha=data.get("dirichlet_alpha", 0.5),
-        languages=",".join(data.get("languages", ["dholuo", "kalenjin", "kidawida"]))
+        languages=",".join(data.get("languages", ["dholuo", "kalenjin", "kidawida"])),
     )
 
     db.session.add(config)
     db.session.commit()
 
-    return jsonify({
-        "message": "Experiment config saved",
-        "config": config.to_dict()
-    }), 200
+    return (
+        jsonify({"message": "Experiment config saved", "config": config.to_dict()}),
+        200,
+    )
 
 
 @app.route("/experiment/config", methods=["GET"])
 def get_experiment_config():
-    config = ExperimentConfig.query.order_by(
-        ExperimentConfig.created_at.desc()
-    ).first()
+    config = ExperimentConfig.query.order_by(ExperimentConfig.created_at.desc()).first()
 
     if not config:
         return jsonify({"error": "No experiment config saved yet"}), 404
@@ -313,6 +349,7 @@ def get_experiment_config():
 # ═══════════════════════════════════════════════════════════
 # US-17 — Experiment Results Export
 # ═══════════════════════════════════════════════════════════
+
 
 @app.route("/experiment/log", methods=["POST"])
 def log_round():
@@ -329,16 +366,13 @@ def log_round():
             accuracy=float(data.get("accuracy", 0)),
             loss=float(data.get("loss", 0)),
             participating_clients=",".join(participating),
-            client_count=len(participating)
+            client_count=len(participating),
         )
 
         db.session.add(log)
         db.session.commit()
 
-        return jsonify({
-            "message": "Round logged",
-            "round_data": log.to_dict()
-        }), 200
+        return jsonify({"message": "Round logged", "round_data": log.to_dict()}), 200
 
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -347,18 +381,23 @@ def log_round():
 @app.route("/experiment/summary", methods=["GET"])
 def get_summary():
     logs = ExperimentLog.query.order_by(ExperimentLog.round_number).all()
-    config = ExperimentConfig.query.order_by(
-        ExperimentConfig.created_at.desc()
-    ).first()
+    config = ExperimentConfig.query.order_by(ExperimentConfig.created_at.desc()).first()
 
-    return jsonify({
-        "experiment_name": config.experiment_name if config else "kenyan_fl_experiment",
-        "total_rounds": len(logs),
-        "configuration": config.to_dict() if config else {},
-        "rounds": [log.to_dict() for log in logs],
-        "start_time": logs[0].logged_at.isoformat() if logs else None,
-        "export_time": datetime.utcnow().isoformat()
-    }), 200
+    return (
+        jsonify(
+            {
+                "experiment_name": (
+                    config.experiment_name if config else "kenyan_fl_experiment"
+                ),
+                "total_rounds": len(logs),
+                "configuration": config.to_dict() if config else {},
+                "rounds": [log.to_dict() for log in logs],
+                "start_time": logs[0].logged_at.isoformat() if logs else None,
+                "export_time": datetime.utcnow().isoformat(),
+            }
+        ),
+        200,
+    )
 
 
 @app.route("/experiment/export/json", methods=["GET"])
@@ -370,11 +409,13 @@ def export_json():
         ).first()
 
         payload = {
-            "experiment_name": config.experiment_name if config else "kenyan_fl_experiment",
+            "experiment_name": (
+                config.experiment_name if config else "kenyan_fl_experiment"
+            ),
             "export_time": datetime.utcnow().isoformat(),
             "configuration": config.to_dict() if config else {},
             "total_rounds": len(logs),
-            "rounds": [log.to_dict() for log in logs]
+            "rounds": [log.to_dict() for log in logs],
         }
 
         buffer = io.BytesIO()
@@ -385,7 +426,7 @@ def export_json():
             buffer,
             mimetype="application/json",
             as_attachment=True,
-            download_name="experiment_results.json"
+            download_name="experiment_results.json",
         )
 
     except Exception as e:
@@ -399,17 +440,28 @@ def export_csv():
 
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow([
-            "round", "accuracy", "loss",
-            "client_count", "participating_clients", "logged_at"
-        ])
+        writer.writerow(
+            [
+                "round",
+                "accuracy",
+                "loss",
+                "client_count",
+                "participating_clients",
+                "logged_at",
+            ]
+        )
 
         for log in logs:
-            writer.writerow([
-                log.round_number, log.accuracy, log.loss,
-                log.client_count, log.participating_clients,
-                log.logged_at.isoformat()
-            ])
+            writer.writerow(
+                [
+                    log.round_number,
+                    log.accuracy,
+                    log.loss,
+                    log.client_count,
+                    log.participating_clients,
+                    log.logged_at.isoformat(),
+                ]
+            )
 
         buffer = io.BytesIO()
         buffer.write(output.getvalue().encode("utf-8"))
@@ -419,7 +471,7 @@ def export_csv():
             buffer,
             mimetype="text/csv",
             as_attachment=True,
-            download_name="experiment_results.csv"
+            download_name="experiment_results.csv",
         )
 
     except Exception as e:
@@ -437,21 +489,24 @@ def reset_experiment():
 # Health Check
 # ═══════════════════════════════════════════════════════════
 
+
 @app.route("/health", methods=["GET"])
 def health_check():
     try:
         client_count = Client.query.count()
-        return jsonify({
-            "status": "healthy",
-            "database": "connected",
-            "registered_clients": client_count,
-            "timestamp": datetime.utcnow().isoformat()
-        }), 200
+        return (
+            jsonify(
+                {
+                    "status": "healthy",
+                    "database": "connected",
+                    "registered_clients": client_count,
+                    "timestamp": datetime.utcnow().isoformat(),
+                }
+            ),
+            200,
+        )
     except Exception as e:
-        return jsonify({
-            "status": "unhealthy",
-            "error": str(e)
-        }), 500
+        return jsonify({"status": "unhealthy", "error": str(e)}), 500
 
 
 # ═══════════════════════════════════════════════════════════
@@ -470,3 +525,157 @@ if __name__ == "__main__":
     print("=" * 55)
 
     app.run(debug=False, host="0.0.0.0", port=5000)
+
+
+# Global model weights in-memory (DB mein store bhi kar sakte ho)
+global_model_weights = None
+client_updates = {}  # {client_id: weights}
+
+
+@app.route("/global-model", methods=["GET"])
+def get_global_model():
+    """
+    US-09: Client ko current global model weights bhejo.
+    Pehli baar random initialize karo agar koi model nahi.
+    """
+    global global_model_weights
+
+    if global_model_weights is None:
+        # Initialize simple model weights
+        # Yeh tumhare actual TF.js model architecture se match karna chahiye
+        global_model_weights = {
+            "version": 0,
+            "architecture": {
+                "vocab_size": 5000,
+                "embedding_dim": 64,
+                "num_classes": 3,
+                "max_length": 100,
+            },
+            "weights": None,  # Pehli round mein client apni marzi se init kare
+            "round": 0,
+        }
+
+    return jsonify(global_model_weights), 200
+
+
+@app.route("/submit-update", methods=["POST"])
+def submit_client_update():
+    """
+    US-10: Client se local training ke baad updated weights receive karo.
+    Jab enough clients submit kar lein FedAvg run karo.
+    """
+    global global_model_weights, client_updates
+
+    data = request.get_json()
+
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    client_id = data.get("client_id")
+    weights = data.get("weights")  # List of weight arrays
+    dataset_size = data.get("dataset_size", 100)
+    metrics = data.get("metrics", {})
+    round_num = data.get("round", 1)
+
+    if not client_id or weights is None:
+        return jsonify({"error": "client_id and weights are required"}), 400
+
+    # Store this client's update
+    client_updates[client_id] = {
+        "weights": weights,
+        "dataset_size": dataset_size,
+        "metrics": metrics,
+        "round": round_num,
+    }
+
+    # Check aggregation config
+    config = get_or_create_aggregation_config()
+    num_updates = len(client_updates)
+    threshold_met = num_updates >= config.min_clients
+
+    response = {
+        "message": "Update received",
+        "updates_received": num_updates,
+        "threshold": config.min_clients,
+        "threshold_met": threshold_met,
+        "round": round_num,
+    }
+
+    # Agar enough updates aa gaye to FedAvg run karo
+    if threshold_met:
+        aggregated = run_fedavg(client_updates)
+        global_model_weights = {
+            "version": (global_model_weights or {}).get("version", 0) + 1,
+            "weights": aggregated,
+            "round": round_num,
+            "num_clients_aggregated": num_updates,
+        }
+        client_updates = {}  # Reset for next round
+        response["aggregated"] = True
+        response["new_model_version"] = global_model_weights["version"]
+
+    return jsonify(response), 200
+
+
+def run_fedavg(updates: dict) -> list:
+    """
+    FedAvg algorithm: dataset-size weighted average of client weights.
+    """
+    if not updates:
+        return []
+
+    # Total dataset size across all clients
+    total_size = sum(u["dataset_size"] for u in updates.values())
+
+    if total_size == 0:
+        return list(updates.values())[0]["weights"]
+
+    aggregated = None
+
+    for client_id, update in updates.items():
+        weight = update["dataset_size"] / total_size
+        client_weights = update["weights"]
+
+        if aggregated is None:
+            # Initialize with zeros matching shape
+            aggregated = [
+                (
+                    [w * weight for w in layer]
+                    if isinstance(layer, list)
+                    else layer * weight
+                )
+                for layer in client_weights
+            ]
+        else:
+            # Add weighted contribution
+            for i, layer in enumerate(client_weights):
+                if isinstance(layer, list):
+                    for j, val in enumerate(layer):
+                        aggregated[i][j] += val * weight
+                else:
+                    aggregated[i] += layer * weight
+
+    return aggregated
+
+
+@app.route("/global-model/ready", methods=["GET"])
+def check_model_ready():
+    """
+    Client check kare agar naya aggregated model ready hai.
+    """
+    global global_model_weights
+
+    if global_model_weights is None:
+        return jsonify({"ready": False, "version": 0}), 200
+
+    return (
+        jsonify(
+            {
+                "ready": True,
+                "version": global_model_weights.get("version", 0),
+                "round": global_model_weights.get("round", 0),
+                "has_weights": global_model_weights.get("weights") is not None,
+            }
+        ),
+        200,
+    )
