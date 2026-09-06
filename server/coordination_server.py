@@ -378,40 +378,102 @@ def model_update():
     return _process_weight_update(data)
 
 
+# def run_fedavg(updates: dict) -> list:
+#     """
+#     FedAvg algorithm: dataset-size weighted average of client weights.
+#     """
+#     if not updates:
+#         return []
+
+#     total_size = sum(u["dataset_size"] for u in updates.values())
+
+#     if total_size == 0:
+#         return list(updates.values())[0]["weights"]
+
+#     aggregated = None
+
+#     for client_id, update in updates.items():
+#         weight = update["dataset_size"] / total_size
+#         client_weights = update["weights"]
+
+#         if aggregated is None:
+#             aggregated = [
+#                 (
+#                     [w * weight for w in layer]
+#                     if isinstance(layer, list)
+#                     else layer * weight
+#                 )
+#                 for layer in client_weights
+#             ]
+#         else:
+#             for i, layer in enumerate(client_weights):
+#                 if isinstance(layer, list):
+#                     for j, val in enumerate(layer):
+#                         aggregated[i][j] += val * weight
+#                 else:
+#                     aggregated[i] += layer * weight
+
+
+#     return aggregated
 def run_fedavg(updates: dict) -> list:
     """
     FedAvg algorithm: dataset-size weighted average of client weights.
+    Frontend se weights teen formats mein aa sakti hain:
+      1. Plain list:          [[0.1, 0.2], [0.3]]
+      2. Nested list:         [[[0.1, 0.2]], [[0.3]]]
+      3. Dict format (TF.js): [{"data": [...], "shape": [...]}]
+    Teeno handle karta hai.
     """
     if not updates:
         return []
 
     total_size = sum(u["dataset_size"] for u in updates.values())
-
     if total_size == 0:
-        return list(updates.values())[0]["weights"]
+        total_size = len(updates)
+
+    def extract_flat(layer):
+        """Kisi bhi format se flat number list nikalo."""
+        if isinstance(layer, dict):
+            # TF.js format: {"data": [...], "shape": [...]}
+            data = (
+                layer.get("data") or layer.get("values") or layer.get("weights") or []
+            )
+            return [float(x) for x in _flatten(data)]
+        elif isinstance(layer, list):
+            return [float(x) for x in _flatten(layer)]
+        else:
+            return [float(layer)]
+
+    def _flatten(lst):
+        """Nested list ko flat karo."""
+        if isinstance(lst, list):
+            for item in lst:
+                yield from _flatten(item)
+        else:
+            yield lst
 
     aggregated = None
 
     for client_id, update in updates.items():
-        weight = update["dataset_size"] / total_size
+        client_weight = update["dataset_size"] / total_size
         client_weights = update["weights"]
 
         if aggregated is None:
-            aggregated = [
-                (
-                    [w * weight for w in layer]
-                    if isinstance(layer, list)
-                    else layer * weight
-                )
-                for layer in client_weights
-            ]
+            aggregated = []
+            for layer in client_weights:
+                flat = extract_flat(layer)
+                aggregated.append([v * client_weight for v in flat])
         else:
             for i, layer in enumerate(client_weights):
-                if isinstance(layer, list):
-                    for j, val in enumerate(layer):
-                        aggregated[i][j] += val * weight
+                flat = extract_flat(layer)
+                if i < len(aggregated):
+                    for j, val in enumerate(flat):
+                        if j < len(aggregated[i]):
+                            aggregated[i][j] += val * client_weight
+                        else:
+                            aggregated[i].append(val * client_weight)
                 else:
-                    aggregated[i] += layer * weight
+                    aggregated.append([v * client_weight for v in flat])
 
     return aggregated
 
