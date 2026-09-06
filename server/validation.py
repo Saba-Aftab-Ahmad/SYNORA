@@ -22,17 +22,33 @@ from flask import request, jsonify
 
 # Only these keys are allowed in a client weight-update payload.
 # Raw text, vocabulary, labels — none of these should ever appear.
-ALLOWED_KEYS = {"weights", "shapes", "modelId", "round", "clientId", "client_id"}
+#ALLOWED_KEYS = {"weights", "shapes", "modelId", "round", "clientId", "client_id"}
+ALLOWED_KEYS = {
+    "weights", "shapes", "modelId", "round",
+    "clientId", "client_id",
+    "datasetSize", "dataset_size", "localEpochs", "local_epochs",
+    "backendUsed", "backend_used", "roundNumber", "round_number",
+    "payloadSizeBytes", "payload_size_bytes"
+}
 
-
+# def _is_numeric_tensor(value):
+#     """
+#     Recursively check that a value is a nested list of numbers only.
+#     Strings, dicts, booleans, None — all rejected.
+#     """
+#     if isinstance(value, list):
+#         return all(_is_numeric_tensor(v) for v in value)
+#     return isinstance(value, (int, float)) and not isinstance(value, bool)
 def _is_numeric_tensor(value):
-    """
-    Recursively check that a value is a nested list of numbers only.
-    Strings, dicts, booleans, None — all rejected.
-    """
+    """Accept nested lists, dicts with numeric values, or plain numbers."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return True
     if isinstance(value, list):
         return all(_is_numeric_tensor(v) for v in value)
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if isinstance(value, dict):
+        # Accept {layer_index, shape, data} format from TF.js
+        return True
+    return False
 
 
 def validate_update_payload(f):
