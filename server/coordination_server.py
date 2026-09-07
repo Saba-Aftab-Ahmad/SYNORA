@@ -864,6 +864,7 @@ Synora Coordination Server — All fixes applied:
 """
 
 import numpy as np
+from preprocessing.loader import load_dataset
 import uuid, csv, json, io, os, sys, random
 from datetime import datetime
 
@@ -1391,3 +1392,31 @@ if __name__ == "__main__":
     print("  Running at: http://127.0.0.1:5000")
     print("=" * 55)
     app.run(debug=False, host="0.0.0.0", port=5000)
+
+# ═══════════════════════════════════════════════════════════
+# US-01/US-09 — Serve real dataset partition to browser client
+# ═══════════════════════════════════════════════════════════
+
+PARTITION_TO_LANGUAGE = {
+    "luo_swa": "dholuo",
+    "kln_swa": "kalenjin",
+    "dav_swa": "kidawida",
+}
+
+@app.route("/dataset/partition/<partition>", methods=["GET"])
+def get_dataset_partition(partition):
+    language = PARTITION_TO_LANGUAGE.get(partition)
+    if not language:
+        return jsonify({"error": "unknown_partition", "message": f"No language mapped for '{partition}'"}), 404
+
+    try:
+        dataset = load_dataset(language)
+    except FileNotFoundError as e:
+        return jsonify({"error": "dataset_not_found", "message": str(e)}), 404
+
+    # Cap sample size so the browser download/tokenization stays fast
+    sample = dataset[:200]
+    texts = [row[0] for row in sample]
+    labels = [row[1] for row in sample]
+
+    return jsonify({"partition": partition, "language": language, "texts": texts, "labels": labels}), 200
