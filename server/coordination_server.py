@@ -1415,7 +1415,7 @@ def get_dataset_partition(partition):
         return jsonify({"error": "dataset_not_found", "message": str(e)}), 404
 
     # Cap sample size so the browser download/tokenization stays fast
-    sample = dataset[:200]
+    sample = dataset[:2000]
     texts = [row[0] for row in sample]
     labels = [row[1] for row in sample]
 
