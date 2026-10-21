@@ -1,1 +1,1 @@
-web: gunicorn server.coordination_server:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+web: gunicorn server.coordination_server:app -c gunicorn.conf.py

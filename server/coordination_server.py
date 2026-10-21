@@ -1,565 +1,684 @@
 """
-Synora Coordination Server — All fixes applied:
-  STEP 1+2: Duplicate round logging fix (40→20)
-  STEP 3:   Language-aware partition assignment
-  STEP 12:  Round-aware FedAvg (no stale state)
-  min_clients=1 for single-browser demo
+Synora Coordination Server  (v2)
+================================
+Flask application that coordinates federated training between browser clients.
+
+  * /api/...        - the documented REST contract (sessions, clients, rounds,
+                      model, metrics, selection, export).
+  * legacy routes   - /register, /clients, /global-model, /submit-update, ...
+                      kept as thin wrappers so older tools / tests still work.
+
+All coordination state is stored in the database (see fl_service.py), so the
+server is correct with several gunicorn workers and recovers after a restart.
 """
 
-import numpy as np
-from preprocessing.loader import load_dataset
-import uuid, csv, json, io, os, sys, random
+import csv
+import io
+import json
+import os
+import sys
+import traceback
+import uuid
 from datetime import datetime
+from functools import wraps
 
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, Response, g, jsonify, request
 from flask_cors import CORS
 from flask_migrate import Migrate
+from sqlalchemy import text
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# make `python server/coordination_server.py` work too (project root on the path)
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
-from server.database import db, init_db
-from server.models import Client, Round, ExperimentConfig, ExperimentLog, AggregationConfig
+from server import data_service, fl_service, model_spec, weight_codec
+from server.api_errors import ApiError, bad_request, forbidden, not_found, unauthorized
+from server.database import db, ensure_schema, init_db
+from server.models import (
+    AggregationConfig,
+    Client,
+    ClientEvent,
+    ClientSelectionLog,
+    ExperimentConfig,
+    ExperimentLog,
+    ExperimentSession,
+    Round,
+    iso,
+    utcnow,
+)
 
 app = Flask(__name__)
-CORS(app, origins="*")
+app.config["MAX_CONTENT_LENGTH"] = 12 * 1024 * 1024
+CORS(
+    app,
+    origins=[o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")],
+    allow_headers=["Content-Type", "X-Session-Token", "X-Admin-Key"],
+    expose_headers=["Content-Disposition"],
+)
 
 init_db(app)
 migrate = Migrate(app, db)
 
-DATA_PARTITIONS = ["dav_swa", "kln_swa", "luo_swa"]
-
-# In-memory global model + per-round updates
-global_model_weights = None
-# STEP 12 FIX: round-aware store {round_number: {client_id: update}}
-client_updates_by_round: dict = {}
-
-
-def get_or_create_aggregation_config():
-    config = AggregationConfig.query.first()
-    if not config:
-        # STEP: min_clients=1 for single-browser demo
-        config = AggregationConfig(min_clients=1, max_rounds=20, current_round=0)
-        db.session.add(config)
-        db.session.commit()
-    return config
+# Create missing tables / add missing columns (works under gunicorn too; the
+# old code only called db.create_all() under `if __name__ == "__main__"`).
+try:
+    ensure_schema(app)
+except Exception as _exc:  # pragma: no cover
+    print(f"[schema] WARNING: could not verify schema at start-up: {_exc}")
 
 
-# ═══════════════════════════════════════════════════════════
-# US-08 — Client Registration
-# ═══════════════════════════════════════════════════════════
+# ── cross-cutting: errors, security headers, auth ────────────────────────
 
-@app.route("/register", methods=["POST"])
-def register_client():
-    data = request.get_json()
-    if not data or "client_name" not in data:
-        return jsonify({"error": "client_name is required"}), 400
-
-    client_name = data["client_name"]
-    existing = Client.query.filter_by(client_name=client_name).first()
-    if existing:
-        return jsonify({"error": f"Client '{client_name}' is already registered", "client_id": existing.client_id}), 409
-
-    client_id = str(uuid.uuid4())
-
-    # STEP 3 FIX: Use partition sent by frontend (language-aware)
-    # Frontend sends correct mapping: Dholuo→luo_swa, Kalenjin→kln_swa, Kidawida→dav_swa
-    requested_partition = data.get("partition")
-    if requested_partition and requested_partition in DATA_PARTITIONS:
-        partition = requested_partition
-    else:
-        # Fallback to round-robin only if no partition sent
-        client_count = Client.query.count()
-        partition = DATA_PARTITIONS[client_count % len(DATA_PARTITIONS)]
-
-    new_client = Client(client_id=client_id, client_name=client_name, partition=partition, status="active")
-    db.session.add(new_client)
-    db.session.commit()
-
-    return jsonify({"message": "Registration successful", "client_id": client_id, "partition": partition, "status": "active"}), 200
+@app.errorhandler(ApiError)
+def _handle_api_error(e: ApiError):
+    db.session.rollback()
+    body, status = e.to_response()
+    return jsonify(body), status
 
 
-@app.route("/clients", methods=["GET"])
-def get_clients():
-    clients = Client.query.all()
-    return jsonify({"total_clients": len(clients), "clients": {c.client_id: c.to_dict() for c in clients}}), 200
+@app.errorhandler(404)
+def _handle_404(e):
+    return jsonify({"error": "not_found", "message": "Resource not found", "field": None, "reference_id": str(uuid.uuid4())}), 404
 
 
-@app.route("/clients/reset", methods=["DELETE"])
-def reset_clients():
-    global client_updates_by_round
-    Client.query.delete()
-    db.session.commit()
-    client_updates_by_round = {}
-    return jsonify({"message": "All clients cleared"}), 200
+@app.errorhandler(405)
+def _handle_405(e):
+    return jsonify({"error": "method_not_allowed", "message": "Method not allowed", "field": None, "reference_id": str(uuid.uuid4())}), 405
 
 
-# ═══════════════════════════════════════════════════════════
-# US-09 — Global Model Distribution
-# ═══════════════════════════════════════════════════════════
-
-def _build_global_model_response():
-    global global_model_weights
-    if global_model_weights is None:
-        global_model_weights = {"version": 0, "architecture": {"vocab_size": 5000, "embedding_dim": 64, "num_classes": 3, "max_length": 100}, "weights": None, "round": 0}
-    return global_model_weights
+@app.errorhandler(413)
+def _handle_413(e):
+    return jsonify({"error": "payload_too_large", "message": "Request body too large", "field": None, "reference_id": str(uuid.uuid4())}), 413
 
 
-@app.route("/global-model", methods=["GET"])
-def get_global_model_old():
-    return jsonify(_build_global_model_response()), 200
+@app.errorhandler(Exception)
+def _handle_500(e):
+    db.session.rollback()
+    ref = str(uuid.uuid4())
+    print(f"[ERROR {ref}] {request.method} {request.path}\n{traceback.format_exc()}")
+    return jsonify({"error": "internal_error", "message": "Unexpected server error", "field": None, "reference_id": ref}), 500
 
 
-@app.route("/model/global", methods=["GET"])
-def get_global_model():
-    return jsonify(_build_global_model_response()), 200
+@app.after_request
+def _security_headers(resp):
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Cache-Control"] = "no-store"
+    if request.headers.get("X-Forwarded-Proto", request.scheme) == "https":
+        resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return resp
 
 
-@app.route("/model/version", methods=["GET"])
-def get_model_version():
-    global global_model_weights
-    version = (global_model_weights or {}).get("version", 0)
-    return jsonify({"version": version}), 200
+def json_body():
+    data = request.get_json(silent=True)
+    if data is None:
+        raise bad_request("A JSON request body is required")
+    return data
 
 
-@app.route("/global-model/ready", methods=["GET"])
-def check_model_ready():
-    global global_model_weights
-    if global_model_weights is None:
-        return jsonify({"ready": False, "version": 0}), 200
-    return jsonify({"ready": True, "version": global_model_weights.get("version", 0), "round": global_model_weights.get("round", 0), "has_weights": global_model_weights.get("weights") is not None}), 200
+def require_client(f):
+    """Session-token authentication (SDS: 401 on missing/invalid token)."""
+
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        token = request.headers.get("X-Session-Token")
+        if not token and request.method == "POST" and request.is_json:
+            token = (request.get_json(silent=True) or {}).get("session_token")  # sendBeacon cannot set headers
+        if not token:
+            raise unauthorized()
+        client = Client.query.filter_by(session_token=token).first()
+        if client is None or client.status == "left":
+            raise unauthorized("Session token is invalid or the client has left the session")
+        g.client = client
+        return f(*args, **kwargs)
+
+    return wrapper
 
 
-# ═══════════════════════════════════════════════════════════
-# US-10 — Weight Submission + FedAvg
-# STEP 1+2+12 FIX: No duplicate logging, round-aware store
-# ═══════════════════════════════════════════════════════════
+def require_admin(f):
+    """Destructive maintenance endpoints need X-Admin-Key == ADMIN_KEY env var."""
 
-ALLOWED_UPDATE_KEYS = {
-    "weights", "shapes", "modelId", "round", "roundNumber", "round_number",
-    "clientId", "client_id", "datasetSize", "dataset_size",
-    "localEpochs", "local_epochs", "backendUsed", "backend_used",
-    "payloadSizeBytes", "payload_size_bytes", "metrics",
-}
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        key = os.getenv("ADMIN_KEY")
+        if not key:
+            raise forbidden("Disabled: set the ADMIN_KEY environment variable to enable this endpoint", "admin_disabled")
+        if request.headers.get("X-Admin-Key") != key:
+            raise forbidden("Invalid admin key", "admin_forbidden")
+        return f(*args, **kwargs)
 
-
-def _process_weight_update(data):
-    global global_model_weights, client_updates_by_round
-
-    if not data:
-        return jsonify({"error": "No data provided"}), 400
-
-    client_id = data.get("client_id") or data.get("clientId")
-    weights = data.get("weights")
-    dataset_size = int(data.get("dataset_size") or data.get("datasetSize") or 64)
-    metrics = data.get("metrics", {})
-    round_num = int(data.get("round") or data.get("roundNumber") or data.get("round_number") or 1)
-
-    # Privacy check
-    unexpected = set(data.keys()) - ALLOWED_UPDATE_KEYS
-    if unexpected:
-        return jsonify({"error": "bad_request", "message": f'Unexpected fields: {unexpected}. Only weight tensors and session identifiers are permitted.', "field": list(unexpected)[0]}), 400
-
-    if not client_id:
-        return jsonify({"error": "client_id is required"}), 400
-    if weights is None:
-        return jsonify({"error": "weights are required"}), 400
-
-    registered = Client.query.filter_by(client_id=client_id).first()
-    if not registered:
-        print(f"[UPDATE] Warning: unregistered client {str(client_id)[:8]}... — accepting in demo mode")
-
-    # STEP 12 FIX: Store update per round, not globally
-    if round_num not in client_updates_by_round:
-        client_updates_by_round[round_num] = {}
-
-    client_updates_by_round[round_num][client_id] = {
-        "weights": weights,
-        "dataset_size": dataset_size,
-        "metrics": metrics,
-        "round": round_num,
-    }
-
-    current_round_updates = client_updates_by_round[round_num]
-    config = get_or_create_aggregation_config()
-    num_updates = len(current_round_updates)
-    threshold_met = num_updates >= config.min_clients
-
-    print(f"[UPDATE] Client {str(client_id)[:8]}... submitted round {round_num} | Updates: {num_updates}/{config.min_clients}")
-
-    response = {
-        "message": "Update received",
-        "status": "accepted",
-        "updates_received": num_updates,
-        "threshold": config.min_clients,
-        "threshold_met": threshold_met,
-        "round": round_num,
-        "client_id": client_id,
-        "aggregated": False,
-    }
-
-    if threshold_met:
-        aggregated = run_fedavg(current_round_updates)
-        # STEP 12 FIX: version = round number (monotonically increasing)
-        global_model_weights = {
-            "version": round_num,
-            "weights": aggregated,
-            "round": round_num,
-            "num_clients_aggregated": num_updates,
-        }
-
-        # Clean up this round's updates
-        del client_updates_by_round[round_num]
-
-        # STEP 1+2 FIX: Backend logs the round ONCE here
-        # Frontend must NOT call logRound() separately
-        try:
-            # STEP 2 FIX: Check for duplicate before inserting
-            existing_log = ExperimentLog.query.filter_by(round_number=round_num).first()
-            if not existing_log:
-                log = ExperimentLog(
-                    round_number=round_num,
-                    accuracy=float(metrics.get("accuracy", 0)),
-                    loss=float(metrics.get("loss", 0)),
-                    participating_clients=",".join(current_round_updates.keys()),
-                    client_count=num_updates,
-                )
-                db.session.add(log)
-                db.session.commit()
-                print(f"[LOG] Round {round_num} logged — acc={metrics.get('accuracy', 0):.3f}")
-            else:
-                print(f"[LOG] Round {round_num} already logged — skipping duplicate")
-        except Exception as e:
-            print(f"[LOG] Could not save round log: {e}")
-
-        response["aggregated"] = True
-        response["new_model_version"] = round_num
-        print(f"[FEDAVG] Round {round_num} aggregated — model v{round_num}")
-
-    return jsonify(response), 200
+    return wrapper
 
 
-@app.route("/submit-update", methods=["POST"])
-def submit_client_update():
-    return _process_weight_update(request.get_json())
+def _client_public(client: Client, include_token=False):
+    d = client.to_dict()
+    if include_token:
+        d["session_token"] = client.session_token
+    return d
 
 
-@app.route("/model/update", methods=["POST"])
-def model_update():
-    return _process_weight_update(request.get_json())
+def _session_for_metrics():
+    sid = request.args.get("session_id")
+    if sid:
+        sess = fl_service.get_session(sid)
+        if sess is None:
+            raise not_found("Session not found", "session_not_found")
+        return sess
+    return fl_service.latest_session()
 
 
-def run_fedavg(updates: dict) -> list:
-    if not updates:
-        return []
+# ═════════════════════════════════════════════════════════════════════════
+# /api  — sessions & clients (US-06, US-08, US-12/13, US-16)
+# ═════════════════════════════════════════════════════════════════════════
 
-    total_size = sum(u["dataset_size"] for u in updates.values())
-    if total_size == 0:
-        total_size = len(updates)
-
-    def extract_flat(layer):
-        if isinstance(layer, dict):
-            data = layer.get("data") or layer.get("values") or layer.get("weights") or []
-            return [float(x) for x in _flatten(data)]
-        elif isinstance(layer, list):
-            return [float(x) for x in _flatten(layer)]
-        else:
-            return [float(layer)]
-
-    def _flatten(lst):
-        if isinstance(lst, list):
-            for item in lst:
-                yield from _flatten(item)
-        else:
-            yield lst
-
-    aggregated = None
-    for client_id, update in updates.items():
-        w = update["dataset_size"] / total_size
-        client_weights = update["weights"]
-        if aggregated is None:
-            aggregated = [[v * w for v in extract_flat(layer)] for layer in client_weights]
-        else:
-            for i, layer in enumerate(client_weights):
-                flat = extract_flat(layer)
-                if i < len(aggregated):
-                    for j, val in enumerate(flat):
-                        if j < len(aggregated[i]):
-                            aggregated[i][j] += val * w
-                        else:
-                            aggregated[i].append(val * w)
-                else:
-                    aggregated.append([v * w for v in flat])
-
-    return aggregated
-
-
-# ═══════════════════════════════════════════════════════════
-# US-11 — Aggregation Threshold
-# ═══════════════════════════════════════════════════════════
-
-@app.route("/config/threshold", methods=["POST"])
-def set_threshold():
-    data = request.get_json()
-    if not data or "min_clients" not in data:
-        return jsonify({"error": "min_clients is required"}), 400
+@app.route("/api/health", methods=["GET"])
+def api_health():
     try:
-        min_clients = int(data["min_clients"])
-        if min_clients < 1:
-            raise ValueError("min_clients must be at least 1")
-        config = get_or_create_aggregation_config()
-        config.min_clients = min_clients
-        config.updated_at = datetime.utcnow()
-        db.session.commit()
-        return jsonify({"message": f"Threshold set to {min_clients}", "config": config.to_dict()}), 200
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-
-
-@app.route("/config/threshold", methods=["GET"])
-def get_threshold():
-    config = get_or_create_aggregation_config()
-    return jsonify(config.to_dict()), 200
-
-
-@app.route("/aggregate/check", methods=["GET"])
-def check_aggregation():
-    config = get_or_create_aggregation_config()
-    connected = Client.query.filter_by(status="active").count()
-    can_aggregate = connected >= config.min_clients
-    if can_aggregate:
-        config.current_round += 1
-        config.updated_at = datetime.utcnow()
-        db.session.commit()
-    return jsonify({"can_aggregate": can_aggregate, "connected_clients": connected, "min_required": config.min_clients, "current_round": config.current_round, "status": "READY" if can_aggregate else "WAITING — below threshold"}), 200
-
-
-# ═══════════════════════════════════════════════════════════
-# US-12 + US-13 — Client Selection
-# ═══════════════════════════════════════════════════════════
-
-@app.route("/config/selection", methods=["POST"])
-def set_selection_count():
-    data = request.get_json()
-    if not data or "selection_count" not in data:
-        return jsonify({"error": "selection_count is required"}), 400
-    try:
-        count = int(data["selection_count"])
-        if count < 1:
-            raise ValueError("selection_count must be at least 1")
-        app.config["SELECTION_COUNT"] = count
-        return jsonify({"message": f"Selection count set to {count}", "selection_count": count}), 200
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-
-
-@app.route("/select/clients", methods=["GET"])
-def select_clients():
-    selection_count = app.config.get("SELECTION_COUNT", 2)
-    all_clients = Client.query.filter_by(status="active").all()
-    if not all_clients:
-        return jsonify({"error": "No clients registered"}), 400
-    count = min(selection_count, len(all_clients))
-    selected = random.sample(all_clients, count)
-    config = get_or_create_aggregation_config()
-    return jsonify({"round": config.current_round, "selected_count": len(selected), "selected_clients": {c.client_id: c.to_dict() for c in selected}, "total_available": len(all_clients)}), 200
-
-
-@app.route("/select/history", methods=["GET"])
-def get_selection_history():
-    all_clients = Client.query.all()
-    logs = ExperimentLog.query.all()
-    participation = {c.client_name: 0 for c in all_clients}
-    for log in logs:
-        for name in log.participating_clients.split(","):
-            name = name.strip()
-            if name in participation:
-                participation[name] += 1
-    total_rounds = len(logs)
-    return jsonify({"total_rounds": total_rounds, "participation_counts": participation, "participation_rates": {name: (round(count / total_rounds, 4) if total_rounds > 0 else 0) for name, count in participation.items()}}), 200
-
-
-# ═══════════════════════════════════════════════════════════
-# US-16 — Experiment Config
-# ═══════════════════════════════════════════════════════════
-
-@app.route("/experiment/config", methods=["POST"])
-def set_experiment_config():
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "Config data required"}), 400
-    config = ExperimentConfig(
-        experiment_name=data.get("experiment_name", "kenyan_fl_experiment"),
-        num_rounds=data.get("num_rounds", 20),
-        num_clients=data.get("num_clients", 1),
-        min_clients_per_round=data.get("min_clients_per_round", 1),
-        learning_rate=data.get("learning_rate", 0.01),
-        batch_size=data.get("batch_size", 16),
-        local_epochs=data.get("local_epochs", 3),
-        partition_type=data.get("partition_type", "non_iid"),
-        dirichlet_alpha=data.get("dirichlet_alpha", 0.5),
-        languages=",".join(data.get("languages", ["dholuo", "kalenjin", "kidawida"])),
-    )
-    db.session.add(config)
-    db.session.commit()
-    return jsonify({"message": "Experiment config saved", "config": config.to_dict()}), 200
-
-
-@app.route("/experiment/config", methods=["GET"])
-def get_experiment_config():
-    config = ExperimentConfig.query.order_by(ExperimentConfig.created_at.desc()).first()
-    if not config:
-        return jsonify({"error": "No experiment config saved yet"}), 404
-    return jsonify(config.to_dict()), 200
-
-
-# ═══════════════════════════════════════════════════════════
-# US-17 — Results Export
-# ═══════════════════════════════════════════════════════════
-
-@app.route("/experiment/log", methods=["POST"])
-def log_round():
-    """
-    Manual round logging endpoint.
-    STEP 2 FIX: Duplicate protection — same round_number
-    will not be inserted twice.
-    """
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "Round data required"}), 400
-    try:
-        participating = data.get("participating_clients", [])
-        round_number = int(data.get("round", ExperimentLog.query.count() + 1))
-
-        # STEP 2 FIX: Prevent duplicate
-        existing = ExperimentLog.query.filter_by(round_number=round_number).first()
-        if existing:
-            return jsonify({"message": "Round already logged", "round_data": existing.to_dict()}), 200
-
-        log = ExperimentLog(
-            round_number=round_number,
-            accuracy=float(data.get("accuracy", 0)),
-            loss=float(data.get("loss", 0)),
-            participating_clients=",".join(participating),
-            client_count=len(participating),
-        )
-        db.session.add(log)
-        db.session.commit()
-        return jsonify({"message": "Round logged", "round_data": log.to_dict()}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-
-@app.route("/experiment/summary", methods=["GET"])
-def get_summary():
-    logs = ExperimentLog.query.order_by(ExperimentLog.round_number).all()
-    config = ExperimentConfig.query.order_by(ExperimentConfig.created_at.desc()).first()
-    return jsonify({
-        "experiment_name": config.experiment_name if config else "kenyan_fl_experiment",
-        "total_rounds": len(logs),
-        "configuration": config.to_dict() if config else {},
-        "rounds": [log.to_dict() for log in logs],
-        "start_time": logs[0].logged_at.isoformat() if logs else None,
-        "export_time": datetime.utcnow().isoformat(),
-    }), 200
-
-
-@app.route("/experiment/export/json", methods=["GET"])
-def export_json():
-    try:
-        logs = ExperimentLog.query.order_by(ExperimentLog.round_number).all()
-        config = ExperimentConfig.query.order_by(ExperimentConfig.created_at.desc()).first()
-        payload = {
-            "experiment_name": config.experiment_name if config else "kenyan_fl_experiment",
-            "export_time": datetime.utcnow().isoformat(),
-            "configuration": config.to_dict() if config else {},
-            "total_rounds": len(logs),
-            "rounds": [log.to_dict() for log in logs],
-        }
-        buffer = io.BytesIO()
-        buffer.write(json.dumps(payload, indent=2).encode("utf-8"))
-        buffer.seek(0)
-        return send_file(buffer, mimetype="application/json", as_attachment=True, download_name="experiment_results.json")
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-
-@app.route("/experiment/export/csv", methods=["GET"])
-def export_csv():
-    try:
-        logs = ExperimentLog.query.order_by(ExperimentLog.round_number).all()
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(["round", "accuracy", "loss", "client_count", "participating_clients", "logged_at"])
-        for log in logs:
-            writer.writerow([log.round_number, log.accuracy, log.loss, log.client_count, log.participating_clients, log.logged_at.isoformat()])
-        buffer = io.BytesIO()
-        buffer.write(output.getvalue().encode("utf-8"))
-        buffer.seek(0)
-        return send_file(buffer, mimetype="text/csv", as_attachment=True, download_name="experiment_results.csv")
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-
-@app.route("/experiment/reset", methods=["DELETE"])
-def reset_experiment():
-    global client_updates_by_round, global_model_weights
-    ExperimentLog.query.delete()
-    db.session.commit()
-    client_updates_by_round = {}
-    global_model_weights = None
-    return jsonify({"message": "Experiment logs cleared"}), 200
-
-
-# ═══════════════════════════════════════════════════════════
-# Health Check
-# ═══════════════════════════════════════════════════════════
-
-@app.route("/health", methods=["GET"])
-def health_check():
-    try:
-        client_count = Client.query.count()
-        return jsonify({"status": "healthy", "database": "connected", "registered_clients": client_count, "timestamp": datetime.utcnow().isoformat()}), 200
+        db.session.execute(text("SELECT 1"))
+        return jsonify({"status": "healthy", "database": "connected", "timestamp": iso(utcnow()), "version": "2.0"}), 200
     except Exception as e:
         return jsonify({"status": "unhealthy", "error": str(e)}), 500
 
 
-# ═══════════════════════════════════════════════════════════
-# Entry Point
-# ═══════════════════════════════════════════════════════════
+@app.route("/api/clients/join", methods=["POST"])
+def api_join():
+    """
+    Register this browser (with its hardware capabilities) and take part in the
+    running training - or start one when none is running.  Nothing is waited for:
+    one client is enough, and any number can join later.
+    Body: {client_name?, config?: {total_rounds?, partition_type?, dirichlet_alpha?},
+           capabilities: {backend, cpu_cores, memory_gb, webgpu_available,
+           webnn_available}, preferred_language?,
+           mode?: "auto" | "join" | "new", session_id?}
+      auto (default) - join the running training, else start one from `config`
+      join           - join the running session `session_id`
+      new            - start a separate session even if one is running (API/tests)
+    Learning rate, epochs, batch size, timeout and client selection are fixed on the
+    server (server/training_settings.py); `config` can only set rounds + data split.
+    """
+    body = json_body()
+    caps = body.get("capabilities") or {}
+    info = {
+        "client_name": body.get("client_name"),
+        "preferred_language": body.get("preferred_language"),
+        "user_agent": request.headers.get("User-Agent"),
+        **{k: caps.get(k) for k in ("backend", "cpu_cores", "memory_gb", "webgpu_available", "webnn_available")},
+    }
+    mode = body.get("mode") or "auto"
+    sid = body.get("session_id")
+    if sid is not None and not isinstance(sid, str):
+        raise bad_request("session_id must be a string", "session_id")
+    result = fl_service.join_session(body.get("config"), info, mode=mode, session_id=sid)
+    sess, client = result["session"], result["client"]
+    return (
+        jsonify(
+            {
+                "message": "Registration successful",
+                "created_session": result["created_session"],
+                "client": _client_public(client, include_token=True),
+                "session": sess.to_dict(),
+                "architecture": model_spec.architecture(),
+            }
+        ),
+        200,
+    )
 
-if __name__ == "__main__":
-    with app.app_context():
-        db.create_all()
-    print("=" * 55)
-    print("  Synora Coordination Server")
-    print("  Running at: http://127.0.0.1:5000")
-    print("=" * 55)
-    app.run(debug=False, host="0.0.0.0", port=5000)
 
-# ═══════════════════════════════════════════════════════════
-# US-01/US-09 — Serve real dataset partition to browser client
-# ═══════════════════════════════════════════════════════════
+@app.route("/api/clients/leave", methods=["POST"])
+@require_client
+def api_leave():
+    body = request.get_json(silent=True, force=True) or {}
+    fl_service.leave_session(g.client, str(body.get("reason", "left"))[:100] if isinstance(body, dict) else "left")
+    return jsonify({"message": "Left session"}), 200
 
-PARTITION_TO_LANGUAGE = {
-    "luo_swa": "dholuo",
-    "kln_swa": "kalenjin",
-    "dav_swa": "kidawida",
-}
+
+@app.route("/api/clients/status", methods=["POST"])
+@require_client
+def api_client_status():
+    body = json_body()
+    fl_service.set_client_state(g.client, body.get("state"))
+    return jsonify({"message": "Status updated", "status": g.client.status}), 200
+
+
+@app.route("/api/clients", methods=["GET"])
+def api_clients():
+    sess = _session_for_metrics()
+    if not sess:
+        return jsonify({"total_clients": 0, "clients": []}), 200
+    ov = fl_service.session_overview(sess)
+    return jsonify({"session_id": sess.session_id, "total_clients": len(ov["clients"]), "clients": ov["clients"]}), 200
+
+
+@app.route("/api/sessions/current", methods=["GET"])
+def api_session_current():
+    """One call for the dashboard / status bar (poll every <= 3 s, NFR-P05)."""
+    cid = request.args.get("client_id")
+    sess = None
+    if cid and not request.args.get("session_id"):
+        c = Client.query.filter_by(client_id=cid).first()       # a client's own page: its own training
+        sess = fl_service.get_session(c.session_id) if c and c.session_id else None
+    return jsonify(fl_service.session_overview(sess or _session_for_metrics(), cid)), 200
+
+
+@app.route("/api/sessions/joinable", methods=["GET"])
+def api_sessions_joinable():
+    """The training that is running right now (the training page shows 'join the running training')."""
+    return jsonify({"sessions": fl_service.joinable_summary()}), 200
+
+
+@app.route("/api/sessions", methods=["GET"])
+def api_sessions():
+    rows = ExperimentSession.query.order_by(ExperimentSession.created_at.desc()).limit(20).all()
+    return jsonify({"sessions": [s.to_dict() for s in rows]}), 200
+
+
+@app.route("/api/sessions/<session_id>", methods=["GET"])
+def api_session_by_id(session_id):
+    sess = fl_service.get_session(session_id)
+    if sess is None:
+        raise not_found("Session not found", "session_not_found")
+    return jsonify(fl_service.session_overview(sess)), 200
+
+
+# ── rounds ───────────────────────────────────────────────────────────────
+
+@app.route("/api/rounds/current", methods=["GET"])
+@require_client
+def api_round_current():
+    return jsonify(fl_service.current_round_view(g.client)), 200
+
+
+@app.route("/api/rounds/submit", methods=["POST"])
+@app.route("/api/rounds/<int:round_number>/submit", methods=["POST"])
+@require_client
+def api_round_submit(round_number=None):
+    data = json_body()
+    if round_number is not None:
+        data.setdefault("round", round_number)
+    result = fl_service.submit_update(g.client, data, payload_bytes=request.content_length or 0)
+    return jsonify(result), 200
+
+
+@app.route("/api/rounds/history", methods=["GET"])
+def api_round_history():
+    sess = _session_for_metrics()
+    if not sess:
+        return jsonify({"rounds": []}), 200
+    rows = Round.query.filter_by(session_id=sess.session_id).order_by(Round.id).all()
+    return jsonify({"session_id": sess.session_id, "rounds": [r.to_dict() for r in rows]}), 200
+
+
+# ── model & data ─────────────────────────────────────────────────────────
+
+@app.route("/api/model/architecture", methods=["GET"])
+def api_model_architecture():
+    return jsonify(model_spec.architecture()), 200
+
+
+@app.route("/api/model/global", methods=["GET"])
+@require_client
+def api_model_global():
+    since = request.args.get("since")
+    return jsonify(fl_service.global_model_payload(g.client.session_id, int(since) if since not in (None, "") else None)), 200
+
+
+@app.route("/api/dataset/shard", methods=["GET"])
+@require_client
+def api_dataset_shard():
+    return jsonify(fl_service.client_shard_payload(g.client)), 200
+
+
+# ── metrics, selection, export ───────────────────────────────────────────
+
+@app.route("/api/metrics/rounds", methods=["GET"])
+def api_metrics_rounds():
+    sess = _session_for_metrics()
+    if not sess:
+        return jsonify({"session_id": None, "rounds": []}), 200
+    logs = ExperimentLog.query.filter_by(session_id=sess.session_id).order_by(ExperimentLog.round_number).all()
+    return jsonify({"session_id": sess.session_id, "rounds": [l.to_dict() for l in logs]}), 200
+
+
+@app.route("/api/metrics/latest", methods=["GET"])
+def api_metrics_latest():
+    sess = _session_for_metrics()
+    if not sess:
+        return jsonify({"latest": None}), 200
+    log = ExperimentLog.query.filter_by(session_id=sess.session_id).order_by(ExperimentLog.round_number.desc()).first()
+    return jsonify({"session_id": sess.session_id, "latest": log.to_dict() if log else None}), 200
+
+
+@app.route("/api/metrics/clients", methods=["GET"])
+def api_metrics_clients():
+    return jsonify({"rows": _client_metric_rows(_session_for_metrics())}), 200
+
+
+@app.route("/api/selection", methods=["GET"])
+def api_selection():
+    sess = _session_for_metrics()
+    if not sess:
+        return jsonify({"selection": []}), 200
+    rows = ClientSelectionLog.query.filter_by(session_id=sess.session_id).order_by(ClientSelectionLog.id).all()
+    return jsonify({"session_id": sess.session_id, "selection": [r.to_dict() for r in rows]}), 200
+
+
+@app.route("/api/events", methods=["GET"])
+def api_events():
+    sess = _session_for_metrics()
+    if not sess:
+        return jsonify({"events": []}), 200
+    rows = ClientEvent.query.filter_by(session_id=sess.session_id).order_by(ClientEvent.id.desc()).limit(100).all()
+    return jsonify({"events": [r.to_dict() for r in rows]}), 200
+
+
+def _client_metric_rows(sess):
+    rows = []
+    if not sess:
+        return rows
+    logs = ExperimentLog.query.filter_by(session_id=sess.session_id).order_by(ExperimentLog.round_number).all()
+    for l in logs:
+        for m in json.loads(l.client_metrics_json or "[]"):
+            rows.append({"session_id": sess.session_id, "round": l.round_number, "timestamp": iso(l.logged_at), **m})
+    return rows
+
+
+_CSV_COLUMNS = [
+    "session_id", "round", "timestamp", "accuracy", "loss", "precision", "recall", "f1",
+    "avg_local_accuracy", "avg_local_loss", "client_count", "participating_clients",
+    "payload_bytes", "aggregation_ms", "round_duration_seconds", "aggregation_method",
+]
+
+
+def _csv_response(rows, columns, filename):
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(columns)
+    for r in rows:
+        w.writerow([r.get(c, "") if r.get(c) is not None else "" for c in columns])
+    return Response(
+        out.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _rounds_for_export(sess):
+    if not sess:
+        return []
+    logs = ExperimentLog.query.filter_by(session_id=sess.session_id).order_by(ExperimentLog.round_number).all()
+    out = []
+    for l in logs:
+        d = l.to_dict()
+        d["participating_clients"] = ";".join(d["participating_clients"])
+        out.append(d)
+    return out
+
+
+@app.route("/api/export/csv", methods=["GET"])
+@app.route("/experiment/export/csv", methods=["GET"])
+def api_export_csv():
+    sess = _session_for_metrics()
+    return _csv_response(_rounds_for_export(sess), _CSV_COLUMNS, "synora_experiment_results.csv")
+
+
+@app.route("/api/export/clients.csv", methods=["GET"])
+def api_export_clients_csv():
+    cols = ["session_id", "round", "timestamp", "client_name", "language", "backend", "dataset_size",
+            "local_accuracy", "local_loss", "train_seconds", "payload_bytes"]
+    return _csv_response(_client_metric_rows(_session_for_metrics()), cols, "synora_client_metrics.csv")
+
+
+@app.route("/api/export/json", methods=["GET"])
+@app.route("/experiment/export/json", methods=["GET"])
+def api_export_json():
+    sess = _session_for_metrics()
+    payload = {
+        "export_time": iso(utcnow()),
+        "session": sess.to_dict() if sess else None,
+        "model": fl_service._model_info(),
+        "rounds": [l.to_dict() for l in ExperimentLog.query.filter_by(session_id=sess.session_id).order_by(ExperimentLog.round_number)] if sess else [],
+        "selection_log": [r.to_dict() for r in ClientSelectionLog.query.filter_by(session_id=sess.session_id).order_by(ClientSelectionLog.id)] if sess else [],
+    }
+    return Response(
+        json.dumps(payload, indent=2),
+        mimetype="application/json",
+        headers={"Content-Disposition": 'attachment; filename="synora_experiment_results.json"'},
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Legacy routes (kept so older scripts / Postman collections keep working)
+# ═════════════════════════════════════════════════════════════════════════
+
+@app.route("/health", methods=["GET"])
+def health_check():
+    try:
+        count = Client.query.count()
+        return jsonify({"status": "healthy", "database": "connected", "registered_clients": count, "timestamp": iso(utcnow())}), 200
+    except Exception as e:
+        return jsonify({"status": "unhealthy", "error": str(e)}), 500
+
+
+@app.route("/register", methods=["POST"])
+def register_client():
+    """Legacy registration: joins the running session (language partitioning)."""
+    data = json_body()
+    if "client_name" not in data:
+        raise bad_request("client_name is required", "client_name")
+    pref = data_service.PARTITION_TO_LANGUAGE.get(data.get("partition"))
+    result = fl_service.join_session(
+        {"partition_type": "language"},
+        {"client_name": data["client_name"], "preferred_language": pref},
+    )
+    c = result["client"]
+    return jsonify({"message": "Registration successful", "client_id": c.client_id, "partition": c.partition,
+                    "status": c.status, "session_token": c.session_token, "session_id": c.session_id}), 200
+
+
+@app.route("/clients", methods=["GET"])
+def get_clients():
+    sess = _session_for_metrics()
+    clients = Client.query.filter_by(session_id=sess.session_id).all() if sess else []
+    return jsonify({"total_clients": len(clients), "clients": {c.client_id: c.to_dict() for c in clients}}), 200
+
+
+@app.route("/clients/reset", methods=["DELETE"])
+@require_admin
+def reset_clients():
+    Client.query.delete()
+    db.session.commit()
+    return jsonify({"message": "All clients cleared"}), 200
+
+
+@app.route("/global-model", methods=["GET"])
+@app.route("/model/global", methods=["GET"])
+def get_global_model_legacy():
+    """Legacy shape: weights as [{shape, data:[...]}] (fixes the old format mismatch)."""
+    sess = fl_service.latest_session()
+    if sess is None:
+        w = model_spec.init_weights(DEFAULT_SEED)
+        return jsonify({"version": 0, "round": 0, "architecture": model_spec.architecture(),
+                        "weights": weight_codec.encode_weights_legacy(w)}), 200
+    payload = fl_service.global_model_payload(sess.session_id)
+    ck_w = weight_codec.decode_weights(payload["weights"])
+    payload["weights"] = weight_codec.encode_weights_legacy(ck_w)
+    return jsonify(payload), 200
+
+
+DEFAULT_SEED = fl_service.DEFAULT_CONFIG["seed"]
+
+
+@app.route("/model/version", methods=["GET"])
+def get_model_version():
+    sess = fl_service.latest_session()
+    return jsonify({"version": sess.model_version if sess else 0}), 200
+
+
+@app.route("/global-model/ready", methods=["GET"])
+def check_model_ready():
+    sess = fl_service.latest_session()
+    return jsonify({"ready": True, "version": sess.model_version if sess else 0,
+                    "round": sess.current_round if sess else 0, "has_weights": True}), 200
+
+
+@app.route("/submit-update", methods=["POST"])
+@app.route("/model/update", methods=["POST"])
+def legacy_submit():
+    data = json_body()
+    cid = data.pop("client_id", None) or data.pop("clientId", None)
+    client = Client.query.filter_by(client_id=cid).first() if cid else None
+    if client is None or client.status == "left":
+        raise unauthorized("Unknown client_id - register first")
+    return jsonify(fl_service.submit_update(client, data, payload_bytes=request.content_length or 0)), 200
+
+
+@app.route("/config/threshold", methods=["POST"])
+def set_threshold():
+    data = json_body()
+    if "min_clients" not in data:
+        raise bad_request("min_clients is required", "min_clients")
+    try:
+        n = int(data["min_clients"])
+        if n < 1:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise bad_request("min_clients must be an integer >= 1", "min_clients")
+    cfg = AggregationConfig.query.first() or AggregationConfig(min_clients=n, max_rounds=20, current_round=0)
+    cfg.min_clients = n
+    db.session.add(cfg)
+    db.session.commit()
+    return jsonify({"message": f"Threshold set to {n}", "config": cfg.to_dict(),
+                    "note": "The threshold of a RUNNING session is fixed when the session starts."}), 200
+
+
+@app.route("/config/threshold", methods=["GET"])
+def get_threshold():
+    sess = fl_service.latest_session()
+    if sess:
+        c = sess.config()
+        return jsonify({"min_clients": c["min_participation_threshold"], "max_rounds": c["total_rounds"],
+                        "current_round": sess.current_round}), 200
+    cfg = AggregationConfig.query.first()
+    return jsonify(cfg.to_dict() if cfg else {"min_clients": 1, "max_rounds": 20, "current_round": 0}), 200
+
+
+@app.route("/aggregate/check", methods=["GET"])
+def check_aggregation():
+    """Read-only status (the old version incremented the round on every GET)."""
+    sess = fl_service.latest_session()
+    if not sess:
+        return jsonify({"can_aggregate": False, "connected_clients": 0, "min_required": 1, "current_round": 0}), 200
+    c = sess.config()
+    live = len(fl_service.live_clients(sess.session_id))
+    return jsonify({"can_aggregate": live >= c["min_participation_threshold"], "connected_clients": live,
+                    "min_required": c["min_participation_threshold"], "current_round": sess.current_round}), 200
+
+
+@app.route("/config/selection", methods=["POST"])
+def set_selection_count():
+    data = json_body()
+    try:
+        count = int(data["selection_count"])
+        if count < 1:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        raise bad_request("selection_count must be an integer >= 1", "selection_count")
+    app.config["SELECTION_COUNT"] = count
+    return jsonify({"message": f"Selection count set to {count}", "selection_count": count}), 200
+
+
+@app.route("/select/clients", methods=["GET"])
+def select_clients():
+    sess = fl_service.latest_session()
+    if not sess:
+        raise bad_request("No clients registered", code="no_clients")
+    rnd = fl_service.latest_round(sess.session_id, sess.current_round) if sess.current_round else None
+    ids = rnd.selected_list() if rnd else []
+    clients = Client.query.filter(Client.client_id.in_(ids)).all() if ids else []
+    return jsonify({"round": sess.current_round, "selected_count": len(clients),
+                    "selected_clients": {c.client_id: c.to_dict() for c in clients},
+                    "total_available": len(fl_service.live_clients(sess.session_id))}), 200
+
+
+@app.route("/select/history", methods=["GET"])
+def get_selection_history():
+    sess = _session_for_metrics()
+    if not sess:
+        return jsonify({"total_rounds": 0, "participation_counts": {}, "participation_rates": {}}), 200
+    rows = ClientSelectionLog.query.filter_by(session_id=sess.session_id, selected=True).all()
+    counts = {}
+    for r in rows:
+        counts[r.client_name] = counts.get(r.client_name, 0) + 1
+    total = ExperimentLog.query.filter_by(session_id=sess.session_id).count()
+    return jsonify({"total_rounds": total, "participation_counts": counts,
+                    "participation_rates": {k: (round(v / total, 4) if total else 0) for k, v in counts.items()}}), 200
+
+
+@app.route("/experiment/config", methods=["POST"])
+def set_experiment_config():
+    data = json_body()
+    cfg = fl_service.normalize_config(data)
+    rec = ExperimentConfig(
+        experiment_name=data.get("experiment_name", "kenyan_fl_experiment"),
+        num_rounds=cfg["total_rounds"], num_clients=cfg["max_clients_per_round"],
+        min_clients_per_round=cfg["min_participation_threshold"], learning_rate=cfg["learning_rate"],
+        batch_size=cfg["batch_size"], local_epochs=cfg["local_epochs"],
+        partition_type=cfg["partition_type"], dirichlet_alpha=cfg["dirichlet_alpha"],
+        languages=",".join(data.get("languages", ["dholuo", "kalenjin", "kidawida"])),
+    )
+    db.session.add(rec)
+    db.session.commit()
+    return jsonify({"message": "Experiment config saved", "config": rec.to_dict()}), 200
+
+
+@app.route("/experiment/config", methods=["GET"])
+def get_experiment_config():
+    sess = fl_service.latest_session()
+    if sess:
+        return jsonify(sess.config()), 200
+    rec = ExperimentConfig.query.order_by(ExperimentConfig.created_at.desc()).first()
+    if not rec:
+        raise not_found("No experiment config saved yet")
+    return jsonify(rec.to_dict()), 200
+
+
+@app.route("/experiment/summary", methods=["GET"])
+def get_summary():
+    sess = _session_for_metrics()
+    rounds = [l.to_dict() for l in ExperimentLog.query.filter_by(session_id=sess.session_id).order_by(ExperimentLog.round_number)] if sess else []
+    return jsonify({"experiment_name": "kenyan_fl_experiment", "total_rounds": len(rounds),
+                    "configuration": sess.config() if sess else {}, "rounds": rounds,
+                    "start_time": rounds[0]["timestamp"] if rounds else None, "export_time": iso(utcnow())}), 200
+
+
+@app.route("/experiment/reset", methods=["DELETE"])
+@require_admin
+def reset_experiment():
+    ExperimentLog.query.delete()
+    db.session.commit()
+    return jsonify({"message": "Experiment logs cleared"}), 200
+
 
 @app.route("/dataset/partition/<partition>", methods=["GET"])
 def get_dataset_partition(partition):
-    language = PARTITION_TO_LANGUAGE.get(partition)
+    """Legacy: raw sentences for one language (the v2 client uses /api/dataset/shard)."""
+    language = data_service.PARTITION_TO_LANGUAGE.get(partition)
     if not language:
-        return jsonify({"error": "unknown_partition", "message": f"No language mapped for '{partition}'"}), 404
+        raise not_found(f"No language mapped for '{partition}'", "unknown_partition")
+    from preprocessing.loader import load_dataset
 
-    try:
-        dataset = load_dataset(language)
-    except FileNotFoundError as e:
-        return jsonify({"error": "dataset_not_found", "message": str(e)}), 404
+    rows = load_dataset(language.lower())[: model_spec.SAMPLES_PER_CLIENT]
+    return jsonify({"partition": partition, "language": language, "texts": [r[0] for r in rows],
+                    "labels": [r[1] for r in rows], "count": len(rows)}), 200
 
-    # Cap sample size so the browser download/tokenization stays fast
-    sample = dataset[:2000]
-    texts = [row[0] for row in sample]
-    labels = [row[1] for row in sample]
 
-    return jsonify({"partition": partition, "language": language, "texts": texts, "labels": labels}), 200
+# ── entry point ──────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "5000"))
+    print("=" * 55)
+    print("  Synora Coordination Server")
+    print(f"  Running at: http://127.0.0.1:{port}")
+    print("=" * 55)
+    data_service.get_data()  # warm the dataset cache
+    app.run(debug=False, host="0.0.0.0", port=port, threaded=True)

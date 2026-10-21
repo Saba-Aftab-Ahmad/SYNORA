@@ -19,6 +19,7 @@ import re
 import os
 import numpy as np
 from pathlib import Path
+from typing import Optional
 
 
 # ─────────────────────────────────────────────
@@ -97,7 +98,8 @@ def tokenize_dataset(samples: list[dict]) -> list[dict]:
 #  STEP 2 — VOCABULARY BUILDER
 # ─────────────────────────────────────────────
 
-def build_vocabulary(tokenized_samples: list[dict]) -> dict[str, int]:
+def build_vocabulary(tokenized_samples: list[dict],
+                     max_vocab_size: Optional[int] = None) -> dict[str, int]:
     """
     Build a vocabulary mapping from word tokens to integer indices.
 
@@ -109,6 +111,14 @@ def build_vocabulary(tokenized_samples: list[dict]) -> dict[str, int]:
 
     Args:
         tokenized_samples: Output of tokenize_dataset()
+        max_vocab_size:    SDS buildVocabulary(corpus, maxVocabSize).
+                           When given, only the most FREQUENT tokens are kept
+                           so that len(vocab) <= max_vocab_size (including the
+                           two special tokens). Ties are broken alphabetically
+                           so the result is reproducible.
+                           When None, the original behaviour is used
+                           (every token with freq >= MIN_WORD_FREQUENCY,
+                           alphabetical order).
 
     Returns:
         vocab: dict mapping word → integer index
@@ -123,7 +133,13 @@ def build_vocabulary(tokenized_samples: list[dict]) -> dict[str, int]:
     # Build vocab: only include words that meet minimum frequency
     vocab = {PADDING_TOKEN: 0, OOV_TOKEN: 1}
     index = 2
-    for word, count in sorted(freq.items()):  # sorted for reproducibility
+    if max_vocab_size is None:
+        ordered = sorted(freq.items())  # sorted for reproducibility
+    else:
+        # most frequent first; alphabetical tie-break; cap the size
+        ordered = sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))
+        ordered = ordered[: max(0, max_vocab_size - 2)]
+    for word, count in ordered:
         if count >= MIN_WORD_FREQUENCY:
             vocab[word] = index
             index += 1

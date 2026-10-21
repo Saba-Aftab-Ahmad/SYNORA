@@ -3,12 +3,16 @@ services:
     name: synora-coordination-server
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn server.coordination_server:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    startCommand: gunicorn server.coordination_server:app -c gunicorn.conf.py
     envVars:
       - key: DATABASE_URL
         sync: false
       - key: SECRET_KEY
         sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false   # e.g. https://your-app.vercel.app  (leave unset to allow all)
+      - key: ADMIN_KEY
+        sync: false   # optional: enables the maintenance DELETE endpoints
       - key: FLASK_ENV
         value: production
       - key: PYTHON_VERSION
